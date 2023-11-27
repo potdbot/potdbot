@@ -34,7 +34,10 @@ class MenuManager(commands.Cog):
                     payload.user_id
                 )
             elif payload.emoji.name == "⏹":
-                if self.active_menus[payload.message_id].owner == payload.user_id:
+                if (
+                    payload.message_id in self.active_menus
+                    and self.active_menus[payload.message_id].owner == payload.user_id
+                ):
                     await self.delete_after(0, payload.message_id)
             elif payload.emoji.name == "▶":
                 await self.active_menus[payload.message_id].next_page(payload.user_id)
@@ -49,7 +52,10 @@ class MenuManager(commands.Cog):
                     payload.user_id
                 )
             elif payload.emoji.name == "⏹":
-                if self.active_menus[payload.message_id].owner == payload.user_id:
+                if (
+                    payload.message_id in self.active_menus
+                    and self.active_menus[payload.message_id].owner == payload.user_id
+                ):
                     await self.delete_after(0, payload.message_id)
             elif payload.emoji.name == "▶":
                 await self.active_menus[payload.message_id].next_page(payload.user_id)
@@ -59,7 +65,7 @@ class Menu:
     def __init__(
         self, ctx: commands.Context, pages: list, cur_page: int = 0, timeout: int = 60
     ):
-        assert pages
+        assert not len(pages) == 0
         self.ctx = ctx
         self.pages = pages
         self.message = None
@@ -86,7 +92,7 @@ class Menu:
     async def remove(self):
         try:
             await self.message.clear_reactions()
-        except discord.Forbidden:
+        except discord.Forbidden as e:
             await self.message.remove_reaction("◀", self.ctx.me)
             await self.message.remove_reaction("⏹", self.ctx.me)
             await self.message.remove_reaction("▶", self.ctx.me)

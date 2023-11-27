@@ -1,26 +1,27 @@
 import random
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
+import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ext.commands import BucketType
 
-from cogs import config as cfg
-from utils import potd_utils
+from cogs.config import Config as cfg
 
 Cog = commands.Cog
 
-POTD_RANGE = "POTD!A2:S"
+from utils import potd_utils
 
 
+# Commands involving todo/read/solved lists
 class Marking(Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(aliases=["mark"], brief="Mark the POTD you have solved")
-    @commands.cooldown(1, 5, BucketType.user)
-    async def potd_mark(self, ctx, *, user_input: str):
-        # parse input
+    # Adds/updates status of POTD
+    async def potd_status_update(self, ctx, user_input, status):
+        # Parse input
         try:
             potd_numbers = [int(i) for i in user_input.split(",")]
         except ValueError:
@@ -31,157 +32,133 @@ class Marking(Cog):
             await ctx.send("Please don't send more than 200 POTDs in each call.")
             return
 
-        # insert to DB
-        added = []
-        already_solved = []
-        no_potd = []
-        no_hint = []
-        has_discussion = []
-        sheet = potd_utils.get_potd_sheet()
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "SELECT discord_user_id, potd_id, create_date FROM potd_solves "
-                f"WHERE discord_user_id = {ctx.author.id} "
-                f"AND potd_id = {potd_number}"
-            )
-            result = cursor.fetchall()
-            if len(result) > 0:
-                already_solved.append(str(potd_number))
-            else:
-                cursor.execute(
-                    f"INSERT INTO potd_solves (discord_user_id, potd_id, create_date) "
-                    f"VALUES ('{ctx.author.id}', '{potd_number}', '{datetime.now()}')"
-                )
-                cursor.execute(
-                    f"DELETE FROM potd_read WHERE discord_user_id = {ctx.author.id} "
-                    f"AND potd_id = {potd_number}"
-                )
-                cursor.execute(
-                    f"DELETE FROM potd_todo WHERE discord_user_id = {ctx.author.id} "
-                    f"AND potd_id = {potd_number}"
-                )
-                added.append(str(potd_number))
+        sorted_potds = {"added": [], "already": [], "no_potd": [], "has_discussion": []}
+        # Update/add/check status in potd_status table
+        values = await potd_utils.get_potd_values()
+        async with cfg.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for potd_number in potd_numbers:
+                    mark_data = {
+                        "author": ctx.author.id,
+                        "potd": potd_number,
+                        "status": status,
+                        "datetime": datetime.now(),
+                    }
 
-            potd_row = potd_utils.get_potd_row(potd_number, sheet)
-            if (
-                potd_row is None
-                or len(potd_row) <= cfg.Config.config["potd_sheet_statement_col"]
-            ):
-                no_potd.append(str(potd_number))
-            else:
-                if (
-                    potd_row is not None
-                    and random.random() < 0.25
-                    and (
-                        len(potd_row) <= cfg.Config.config["potd_sheet_hint1_col"]
-                        or potd_row[cfg.Config.config["potd_sheet_hint1_col"]] is None
+                    await cursor.execute(
+                        """SELECT status FROM potd_status
+                           WHERE user_id = :author AND potd_id = :potd""",
+                        mark_data,
                     )
-                ):
-                    no_hint.append(str(potd_number))
-                if potd_row is not None and (
-                    len(potd_row) > cfg.Config.config["potd_sheet_discussion_col"]
-                    and potd_row[cfg.Config.config["potd_sheet_discussion_col"]]
-                    is not None
-                    and potd_row[cfg.Config.config["potd_sheet_discussion_col"]] != ""
-                ):
-                    has_discussion.append(str(potd_number))
+                    result = await cursor.fetchone()
+                    if result and result[0] == status:
+                        sorted_potds["already"].append(str(potd_number))
+                    else:
+                        if result:
+                            await cursor.execute(
+                                """UPDATE potd_status SET status = :status, datetime = :datetime
+                                   WHERE user_id = :author AND potd_id = :potd""",
+                                mark_data,
+                            )
+                        else:
+                            await cursor.execute(
+                                """INSERT INTO potd_status
+                                    (user_id, potd_id, status, datetime) 
+                                    VALUES (:author, :potd, :status, :datetime)""",
+                                mark_data,
+                            )
+                        sorted_potds["added"].append(str(potd_number))
 
-        # send confirm message
+                        potd_row = await potd_utils.get_potd_row(potd_number, values)
+                        if (
+                            potd_row is None
+                            or len(potd_row) <= cfg.config["potd_sheet_statement_col"]
+                        ):
+                            sorted_potds["no_potd"].append(str(potd_number))
+                        else:
+                            if potd_row is not None:
+                                if (
+                                    len(potd_row)
+                                    > cfg.config["potd_sheet_discussion_col"]
+                                    and potd_row[
+                                        cfg.config["potd_sheet_discussion_col"]
+                                    ]
+                                    is not None
+                                    and potd_row[
+                                        cfg.config["potd_sheet_discussion_col"]
+                                    ]
+                                    != ""
+                                ):
+                                    sorted_potds["has_discussion"].append(
+                                        str(potd_number)
+                                    )
+
+        # Send confirm message
         messages = []
-        if added:
-            if len(added) == 1:
+        if len(sorted_potds["added"]) != 0:
+            if len(sorted_potds["added"]) == 1:
+                if status == "todo":
+                    messages.append(
+                        f"POTD {sorted_potds['added'][0]} is added to your {status} list."
+                    )
+                else:
+                    messages.append(
+                        f"POTD {sorted_potds['added'][0]} is added to your {status} list. Use `-rate {sorted_potds['added'][0]} <rating>` if you want to rate the difficulty of this problem."
+                    )
+            else:
                 messages.append(
-                    f"POTD {added[0]} is added to your solved list. "
-                    f"Use `-rate {added[0]} <rating>` if you want to rate the "
-                    "difficulty of this problem."
+                    f'POTD {",".join(sorted_potds["added"])} are added to your {status} list.'
+                )
+        if len(sorted_potds["already"]) != 0:
+            if len(sorted_potds["already"]) == 1:
+                messages.append(
+                    f'POTD {sorted_potds["already"][0]} is already in your {status} list.'
                 )
             else:
                 messages.append(
-                    f'POTD {",".join(added)} are added to your solved list.'
+                    f'POTD {",".join(sorted_potds["already"])} are already in your {status} list.'
                 )
-        if already_solved:
-            if len(already_solved) == 1:
+        if len(sorted_potds["no_potd"]) != 0:
+            if len(sorted_potds["no_potd"]) == 1:
                 messages.append(
-                    f"POTD {already_solved[0]} is already in your solved list."
+                    f'There is no POTD {sorted_potds["no_potd"][0]}. Are you sure you have inputted the correct number?'
                 )
             else:
                 messages.append(
-                    f'POTD {",".join(already_solved)} are already in your solved list.'
+                    f'There are no POTD  {",".join(sorted_potds["no_potd"])}. Are you sure you have inputted the correct number?'
                 )
-        if no_potd:
-            if len(no_potd) == 1:
-                messages.append(
-                    f"There is no POTD {no_potd[0]}. "
-                    "Are you sure you have inputted the correct number?"
-                )
-            else:
-                messages.append(
-                    f'There are no POTD  {",".join(no_potd)}. '
-                    "Are you sure you have inputted the correct number?"
-                )
-        if no_hint:
-            if len(no_hint) == 1:
-                messages.append(
-                    f"There is no hint for POTD {no_hint[0]}. "
-                    "Would you like to contribute one? "
-                    f"Contact <@{cfg.Config.config['staffmail_id']}> to submit a hint!"
-                )
-            else:
-                messages.append(
-                    f"There are no hint for POTD {','.join(no_hint)}. "
-                    "Would you like to contribute one? "
-                    f"Contact <@{cfg.Config.config['staffmail_id']}> to submit a hint!"
-                )
-        if has_discussion:
-            if len(has_discussion) == 1:
-                messages.append(
-                    f"There is discussion for POTD {has_discussion[0]}. "
-                    "Use `-discussion {has_discussion[0]}` to see the discussion."
-                )
-            else:
-                messages.append(
-                    f"Ther are discussions for POTD {','.join(has_discussion)}."
-                    "Use `-discussion <number>` to see the discussions."
-                )
+
+        # Give discussion if marked as done
+        if status != "todo":
+            if len(sorted_potds["has_discussion"]) != 0:
+                if len(sorted_potds["has_discussion"]) == 1:
+                    messages.append(
+                        f'There is discussion for POTD {sorted_potds["has_discussion"][0]}. Use `-discussion {sorted_potds["has_discussion"][0]}` to see the discussion.'
+                    )
+                else:
+                    messages.append(
+                        f"There are discussions for POTD {','.join(sorted_potds['has_discussion'])}. Use `-discussion <number>` to see the discussions."
+                    )
         message = "\n".join(messages)
         await ctx.send(message)
 
-    @commands.command(aliases=["unmark"], brief="Unmark the POTD from your solved list")
+    @commands.command(aliases=["mark"], brief="Mark the POTD you have solved")
     @commands.cooldown(1, 5, BucketType.user)
-    async def potd_unmark(self, ctx, *, user_input: str):
-        # parse input
-        try:
-            potd_numbers = [int(i) for i in user_input.split(",")]
-        except ValueError:
-            await ctx.send("Error: The input contains non-integer values.")
-            return
-
-        if len(potd_numbers) > 200:
-            await ctx.send("Please don't send more than 200 POTDs in each call.")
-            return
-
-        # delete from DB
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "DELETE FROM potd_solves "
-                f"WHERE discord_user_id = {ctx.author.id} AND potd_id = {potd_number}"
-            )
-
-        # send confirm message
-        if len(potd_numbers) == 1:
-            await ctx.send(f"POTD {potd_numbers[0]} is removed from your solved list. ")
-        else:
-            await ctx.send(
-                f'POTD {",".join(list(map(str,potd_numbers)))} are removed from your '
-                "solved list. "
-            )
+    async def potd_mark(self, ctx, *, user_input: str):
+        await self.potd_status_update(ctx, user_input, "solved")
 
     @commands.command(aliases=["read"], brief="Mark the POTD you have read")
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_read(self, ctx, *, user_input: str):
-        # parse input
+        await self.potd_status_update(ctx, user_input, "read")
+
+    @commands.command(aliases=["todo"], brief="Mark the POTD into your TODO list")
+    @commands.cooldown(1, 5, BucketType.user)
+    async def potd_todo(self, ctx, *, user_input: str):
+        await self.potd_status_update(ctx, user_input, "todo")
+
+    async def potd_status_remove(self, ctx, user_input, status):
+        # Parse input
         try:
             potd_numbers = [int(i) for i in user_input.split(",")]
         except ValueError:
@@ -192,166 +169,52 @@ class Marking(Cog):
             await ctx.send("Please don't send more than 200 POTDs in each call.")
             return
 
-        # insert to DB
-        added = []
-        already_read = []
-        no_potd = []
-        no_hint = []
-        has_discussion = []
-        sheet = potd_utils.get_potd_sheet()
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "SELECT discord_user_id, potd_id, create_date FROM potd_read "
-                f"WHERE discord_user_id = {ctx.author.id} "
-                f"AND potd_id = {potd_number}"
-            )
-            result = cursor.fetchall()
-            if len(result) > 0:
-                already_read.append(str(potd_number))
-            else:
-                cursor.execute(
-                    "INSERT INTO potd_read (discord_user_id, potd_id, create_date) "
-                    f"VALUES ('{ctx.author.id}', '{potd_number}', '{datetime.now()}')"
-                )
-                cursor.execute(
-                    f"DELETE FROM potd_solves WHERE discord_user_id = {ctx.author.id} "
-                    f"AND potd_id = {potd_number}"
-                )
-                cursor.execute(
-                    f"DELETE FROM potd_todo WHERE discord_user_id = {ctx.author.id} "
-                    f"AND potd_id = {potd_number}"
-                )
-                added.append(str(potd_number))
-
-            potd_row = potd_utils.get_potd_row(potd_number, sheet)
-            if (
-                potd_row is None
-                or len(potd_row) <= cfg.Config.config["potd_sheet_statement_col"]
-            ):
-                no_potd.append(str(potd_number))
-            else:
-                if (
-                    potd_row is not None
-                    and random.random() < 0.25
-                    and (
-                        len(potd_row) <= cfg.Config.config["potd_sheet_hint1_col"]
-                        or potd_row[cfg.Config.config["potd_sheet_hint1_col"]] is None
+        async with cfg.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                for potd_id in potd_numbers:
+                    await cursor.execute(
+                        """DELETE FROM potd_status
+                           WHERE user_id = ? AND potd_id = ?
+                           AND status = ?""",
+                        (ctx.author.id, potd_id, status),
                     )
-                ):
-                    no_hint.append(str(potd_number))
-                if potd_row is not None and (
-                    len(potd_row) > cfg.Config.config["potd_sheet_discussion_col"]
-                    and potd_row[cfg.Config.config["potd_sheet_discussion_col"]]
-                    is not None
-                    and potd_row[cfg.Config.config["potd_sheet_discussion_col"]] != ""
-                ):
-                    has_discussion.append(str(potd_number))
 
-        # send confirm message
-        messages = []
-        if added:
-            if len(added) == 1:
-                messages.append(f"POTD {added[0]} is added to your read list.")
-            else:
-                messages.append(f'POTD {",".join(added)} are added to your read list.')
-        if already_read:
-            if len(already_read) == 1:
-                messages.append(f"POTD {already_read[0]} is already in your read list.")
-            else:
-                messages.append(
-                    f'POTD {",".join(already_read)} are already in your read list.'
-                )
-        if no_potd:
-            if len(no_potd) == 1:
-                messages.append(
-                    f"There is no POTD {no_potd[0]}. "
-                    "Are you sure you have inputted the correct number?"
-                )
-            else:
-                messages.append(
-                    f'There are no POTD  {",".join(no_potd)}. '
-                    "Are you sure you have inputted the correct number?"
-                )
-        if no_hint:
-            if len(no_hint) == 1:
-                messages.append(
-                    f"There is no hint for POTD {no_hint[0]}. "
-                    "Would you like to contribute one? "
-                    f"Contact <@{cfg.Config.config['staffmail_id']}> to submit a hint!"
-                )
-            else:
-                messages.append(
-                    f"There are no hint for POTD {','.join(no_hint)}. "
-                    "Would you like to contribute one? "
-                    f"Contact <@{cfg.Config.config['staffmail_id']}> to submit a hint!"
-                )
-        if has_discussion:
-            if len(has_discussion) == 1:
-                messages.append(
-                    f"There is discussion for POTD {has_discussion[0]}. "
-                    f"Use `-discussion {has_discussion[0]}` to see the discussion."
-                )
-            else:
-                messages.append(
-                    f"Ther are discussions for POTD {','.join(has_discussion)}. "
-                    "Use `-discussion <number>` to see the discussions."
-                )
-        message = "\n".join(messages)
-        await ctx.send(message)
+        # Send confirm message
+        if len(potd_numbers) == 1:
+            await ctx.send(
+                f"POTD {potd_numbers[0]} is removed from your {status} list. "
+            )
+        else:
+            await ctx.send(f"POTDs {user_input} are removed from your {status} list. ")
+
+    @commands.command(aliases=["unmark"], brief="Unmark the POTD from your solved list")
+    @commands.cooldown(1, 5, BucketType.user)
+    async def potd_unmark(self, ctx, *, user_input: str):
+        await self.potd_status_remove(ctx, user_input, "solved")
 
     @commands.command(aliases=["unread"], brief="Unmark the POTD from your read list")
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_unread(self, ctx, *, user_input: str):
-        # parse input
-        try:
-            potd_numbers = [int(i) for i in user_input.split(",")]
-        except ValueError:
-            await ctx.send("Error: The input contains non-integer values.")
-            return
+        await self.potd_status_remove(ctx, user_input, "read")
 
-        if len(potd_numbers) > 200:
-            await ctx.send("Please don't send more than 200 POTDs in each call.")
-            return
-
-        # delete from DB
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "DELETE FROM potd_read "
-                f"WHERE discord_user_id = {ctx.author.id} AND potd_id = {potd_number}"
-            )
-
-        # send confirm message
-        if len(potd_numbers) == 1:
-            await ctx.send(f"POTD {potd_numbers[0]} is removed from your read list. ")
-        else:
-            await ctx.send(
-                f'POTD {",".join(list(map(str,potd_numbers)))} are removed from your '
-                "read list. "
-            )
+    @commands.command(aliases=["untodo"], brief="Unmark the POTD from your TODO list")
+    @commands.cooldown(1, 5, BucketType.user)
+    async def potd_untodo(self, ctx, *, user_input: str):
+        await self.potd_status_remove(ctx, user_input, "todo")
 
     @commands.command(
         aliases=["solved"],
         brief="Show the POTDs you have solved or read",
         help="`-solved`: Show the POTDs you have solved or read.\n"
-        "`-solved d`: Show the POTDs you have solved or read, ordered by "
-        "difficulties.\n"
-        "`-solved s`: Show the POTDs you have solved or read, divided into the four "
-        "subjects.\n",
+        "`-solved d`: Show the POTDs you have solved or read, ordered by difficulties.\n"
+        "`-solved s`: Show the POTDs you have solved or read, divided into the four subjects.\n",
     )
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_solved(self, ctx, flag=None):
-        solved = potd_utils.get_potd_solved(ctx)
-        read = potd_utils.get_potd_read(ctx)
+        solved = await potd_utils.get_potd_status("solved", ctx)
+        read = await potd_utils.get_potd_status("read", ctx)
 
-        potd_rows = (
-            cfg.Config.service.spreadsheets()
-            .values()
-            .get(spreadsheetId=cfg.Config.config["potd_sheet"], range=POTD_RANGE)
-            .execute()
-            .get("values", [])
-        )
+        potd_rows = await potd_utils.get_potd_values()
         current_potd = int(potd_rows[0][0])
 
         if len(solved) > 0:
@@ -365,110 +228,21 @@ class Marking(Cog):
         if len(solved) == 0 and len(read) == 0:
             await ctx.send("Your solved list and read list are empty.")
 
-    @commands.command(aliases=["todo"], brief="Mark the POTD into your TODO list")
-    @commands.cooldown(1, 5, BucketType.user)
-    async def potd_todo(self, ctx, *, user_input: str):
-        # parse input
-        try:
-            potd_numbers = [int(i) for i in user_input.split(",")]
-        except ValueError:
-            await ctx.send("Error: The input contains non-integer values.")
-            return
-
-        if len(potd_numbers) > 200:
-            await ctx.send("Please don't send more than 200 POTDs in each call.")
-            return
-
-        # insert to DB
-        added = []
-        already_todo = []
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "SELECT discord_user_id, potd_id, create_date FROM potd_todo "
-                f"WHERE discord_user_id = {ctx.author.id} "
-                f"AND potd_id = {potd_number}"
-            )
-            result = cursor.fetchall()
-            if len(result) > 0:
-                already_todo.append(str(potd_number))
-            else:
-                cursor.execute(
-                    "INSERT INTO potd_todo (discord_user_id, potd_id, create_date) "
-                    f"VALUES ('{ctx.author.id}', '{potd_number}', '{datetime.now()}')"
-                )
-                added.append(str(potd_number))
-
-        # send confirm message
-        messages = []
-        if added:
-            if len(added) == 1:
-                messages.append(f"POTD {added[0]} is added to your TODO list.")
-            else:
-                messages.append(f'POTD {",".join(added)} are added to your TODO list.')
-        if already_todo:
-            if len(already_todo) == 1:
-                messages.append(f"POTD {already_todo[0]} is already in your TODO list.")
-            else:
-                messages.append(
-                    f'POTD {",".join(already_todo)} are already in your TODO list.'
-                )
-        message = "\n".join(messages)
-        await ctx.send(message)
-
-    @commands.command(aliases=["untodo"], brief="Unmark the POTD from your TODO list")
-    @commands.cooldown(1, 5, BucketType.user)
-    async def potd_untodo(self, ctx, *, user_input: str):
-        # parse input
-        try:
-            potd_numbers = [int(i) for i in user_input.split(",")]
-        except ValueError:
-            await ctx.send("Error: The input contains non-integer values.")
-            return
-
-        if len(potd_numbers) > 200:
-            await ctx.send("Please don't send more than 200 POTDs in each call.")
-            return
-
-        # delete from DB
-        for potd_number in potd_numbers:
-            cursor = cfg.db.cursor()
-            cursor.execute(
-                "DELETE FROM potd_todo "
-                f"WHERE discord_user_id = {ctx.author.id} AND potd_id = {potd_number}"
-            )
-
-        # send confirm message
-        if len(potd_numbers) == 1:
-            await ctx.send(f"POTD {potd_numbers[0]} is removed from your TODO list. ")
-        else:
-            await ctx.send(
-                f'POTD {",".join(list(map(str,potd_numbers)))} are removed from your '
-                "TODO list. "
-            )
-
     @commands.command(
         aliases=["mytodo"],
         brief="Show the POTDs in your TODO list",
         help="`-mytodo`: Show the POTDs in your TODO list.\n"
         "`-mytodo d`: Show the POTDs in your TODO list, ordered by difficulties.\n"
-        "`-mytodo s`: Show the POTDs in your TODO list, divided into the four "
-        "subjects.\n",
+        "`-mytodo s`: Show the POTDs in your TODO list, divided into the four subjects.\n",
     )
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_mytodo(self, ctx, flag=None):
-        todo = potd_utils.get_potd_todo(ctx)
+        todo = await potd_utils.get_potd_status("todo", ctx)
 
-        potd_rows = (
-            cfg.Config.service.spreadsheets()
-            .values()
-            .get(spreadsheetId=cfg.Config.config["potd_sheet"], range=POTD_RANGE)
-            .execute()
-            .get("values", [])
-        )
+        potd_rows = await potd_utils.get_potd_values()
+        current_potd = int(potd_rows[0][0])
+
         if len(todo) > 0:
-            current_potd = int(potd_rows[0][0])
-
             await self.generate_potd_list_output_string(
                 todo, potd_rows, current_potd, flag, "TODO", ctx, True
             )
@@ -478,49 +252,39 @@ class Marking(Cog):
     @commands.command(
         aliases=["unrated"],
         brief="Fetch a random POTD that you have solved/read but not yet rated",
-        help="`-unrated`: Fetch a random POTD that you have solved/read but not yet "
-        "rated.\n",
+        help="`-unrated`: Fetch a random POTD that you have solved/read but not yet rated.\n",
     )
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_unrated(self, ctx, flag=None):
-        solved = potd_utils.get_potd_solved(ctx)
-        read = potd_utils.get_potd_read(ctx)
-        rated = potd_utils.get_potd_rated(ctx)
+        solved = await potd_utils.get_potd_status("solved", ctx)
+        read = await potd_utils.get_potd_status("read", ctx)
+        rated = await potd_utils.get_potd_rated(ctx)
 
         unrated = [x for x in (solved + read) if x not in rated]
 
         picked_potd = random.choice(unrated)
-        await potd_utils.fetch(ctx, int(picked_potd))
+        await potd_utils.potd_fetch(ctx, int(picked_potd))
 
     @commands.command(
         aliases=["unrated_list"],
         brief="Get the list of POTD that you have solved/read but not yet rated",
-        help="`-unrated_list`: Get the list of POTD that you have solved/read but not "
-        "yet rated.\n"
-        "`-unrated_list d`: Get the list of POTD that you have solved/read but not yet "
-        "rated, ordered by difficulties.\n"
-        "`-unrated_list s`: Get the list of POTD that you have solved/read but not yet "
-        "rated, divided into the four subjects.\n",
+        help="`-unrated_list`: Get the list of POTD that you have solved/read but not yet rated.\n"
+        "`-unrated_list d`: Get the list of POTD that you have solved/read but not yet rated, ordered by difficulties.\n"
+        "`-unrated_list s`: Get the list of POTD that you have solved/read but not yet rated, divided into the four subjects.\n",
     )
     @commands.cooldown(1, 5, BucketType.user)
     async def potd_unrated_list(self, ctx, flag=None):
-        solved = potd_utils.get_potd_solved(ctx)
-        read = potd_utils.get_potd_read(ctx)
-        rated = potd_utils.get_potd_rated(ctx)
+        solved = await potd_utils.get_potd_status("solved", ctx)
+        read = await potd_utils.get_potd_status("read", ctx)
+        rated = await potd_utils.get_potd_rated(ctx)
 
         solved_unrated = [x for x in solved if x not in rated]
         read_unrated = [x for x in read if x not in rated]
 
-        potd_rows = (
-            cfg.Config.service.spreadsheets()
-            .values()
-            .get(spreadsheetId=cfg.Config.config["potd_sheet"], range=POTD_RANGE)
-            .execute()
-            .get("values", [])
-        )
+        potd_rows = await potd_utils.get_potd_values()
         current_potd = int(potd_rows[0][0])
 
-        if solved_unrated:
+        if len(solved_unrated) > 0:
             await self.generate_potd_list_output_string(
                 solved_unrated,
                 potd_rows,
@@ -530,32 +294,30 @@ class Marking(Cog):
                 ctx,
                 True,
             )
-        if read_unrated:
+        if len(read_unrated) > 0:
             await self.generate_potd_list_output_string(
                 read_unrated, potd_rows, current_potd, flag, "unrated (read)", ctx, True
             )
-        if not solved_unrated and not read_unrated:
-            await ctx.send("You have no unrated POTD.")
+        if len(solved_unrated) == 0 and len(read_unrated) == 0:
+            await ctx.send("You have no unrated POTDs.")
 
+    # Given a list of POTD numbers, print them by difficulty/subject
     async def generate_potd_list_output_string(
         self, potd_list, potd_rows, current_potd, flag, adjective, ctx, show_total=True
     ):
+        potd_rows = await potd_utils.get_potd_values()
         if flag == "d":
-            solved_by_difficulty = {}
+            solved_by_difficulty = defaultdict(list)
             for number in potd_list:
                 if number > current_potd or number <= 0:
                     difficulty = "(Unknown)"
                 else:
-                    potd_row = potd_rows[current_potd - number]
-                    if len(potd_row) > cfg.Config.config["potd_sheet_difficulty_col"]:
-                        difficulty = potd_row[
-                            cfg.Config.config["potd_sheet_difficulty_col"]
-                        ]
+                    potd_row = await potd_utils.get_potd_row(number, potd_rows)
+                    if len(potd_row) > cfg.config["potd_sheet_difficulty_col"]:
+                        difficulty = potd_row[cfg.config["potd_sheet_difficulty_col"]]
                     else:
                         difficulty = "(Unknown)"
 
-                if difficulty not in solved_by_difficulty:
-                    solved_by_difficulty[difficulty] = []
                 solved_by_difficulty[difficulty].append(number)
 
             sorted_keys = sorted(
@@ -563,34 +325,32 @@ class Marking(Cog):
                 key=lambda x: (x.isnumeric(), int(x) if x.isnumeric() else x),
                 reverse=True,
             )
-            solved_by_difficulty = {
-                key: solved_by_difficulty[key] for key in sorted_keys
-            }
 
             output_string = f"# __Your {adjective} POTD__ \n"
-            for key in solved_by_difficulty:
-                if show_total is True:
+            for key in sorted_keys:
+                if show_total:
                     total = len(
                         [
                             potd
                             for potd in potd_rows
-                            if len(potd)
-                            > cfg.Config.config["potd_sheet_difficulty_col"]
-                            and potd[cfg.Config.config["potd_sheet_difficulty_col"]]
-                            == key
+                            if len(potd) > cfg.config["potd_sheet_difficulty_col"]
+                            and potd[cfg.config["potd_sheet_difficulty_col"]] == key
                         ]
                     )
                     output_string += (
                         "**D"
                         + key
                         + ":** "
-                        + f"{solved_by_difficulty[key]} "
-                        + f"({len(solved_by_difficulty[key])}/{total})\n"
+                        + f"{solved_by_difficulty[key]} ({len(solved_by_difficulty[key])}/{total})"
+                        + "\n"
                     )
                 else:
-                    output_string += f"**D{key}:** {solved_by_difficulty[key]} \n"
+                    output_string += (
+                        "**D" + key + ":** " + f"{solved_by_difficulty[key]} " + "\n"
+                    )
             if show_total:
                 output_string += f"(Total: {len(potd_list)}/{len(potd_rows)})"
+
         elif flag == "s":
             solved_by_genre = {"A": [], "C": [], "G": [], "N": []}
             for number in potd_list:
@@ -598,43 +358,40 @@ class Marking(Cog):
                     genre = "(Unknown)"
                 else:
                     potd_row = potd_rows[current_potd - number]
-                    if len(potd_row) > cfg.Config.config["potd_sheet_genre_col"]:
-                        genre = potd_row[cfg.Config.config["potd_sheet_genre_col"]]
+                    if len(potd_row) > cfg.config["potd_sheet_genre_col"]:
+                        genre = potd_row[cfg.config["potd_sheet_genre_col"]]
                     else:
                         genre = "(Unknown)"
 
-                if "A" in genre:
-                    solved_by_genre["A"].append(number)
-                if "C" in genre:
-                    solved_by_genre["C"].append(number)
-                if "G" in genre:
-                    solved_by_genre["G"].append(number)
-                if "N" in genre:
-                    solved_by_genre["N"].append(number)
+                for subj in "ACGN":
+                    if subj in genre:
+                        solved_by_genre[subj].append(number)
 
             output_string = f"# __Your {adjective} POTD__ \n"
             for key in solved_by_genre:
-                if show_total is True:
+                if show_total:
                     total = len(
                         [
                             potd
                             for potd in potd_rows
-                            if len(potd)
-                            > cfg.Config.config["potd_sheet_difficulty_col"]
-                            and key in potd[cfg.Config.config["potd_sheet_genre_col"]]
+                            if len(potd) > cfg.config["potd_sheet_genre_col"]
+                            and key in potd[cfg.config["potd_sheet_genre_col"]]
                         ]
                     )
                     output_string += (
                         "**"
                         + key
                         + ":** "
-                        + f"{solved_by_genre[key]} "
-                        + f"({len(solved_by_genre[key])}/{total})\n"
+                        + f"{solved_by_genre[key]} ({len(solved_by_genre[key])}/{total})"
+                        + "\n"
                     )
                 else:
-                    output_string += f"**{key}:** {solved_by_genre[key]} \n"
-            if show_total is True:
+                    output_string += (
+                        "**" + key + ":** " + f"{solved_by_genre[key]} " + "\n"
+                    )
+            if show_total:
                 output_string += f"(Total: {len(potd_list)}/{len(potd_rows)})"
+
         elif flag == "sd":
             solved_ordered = {
                 "A": defaultdict(list),
@@ -648,14 +405,12 @@ class Marking(Cog):
                     difficulty = "(Unknown)"
                 else:
                     potd_row = potd_rows[current_potd - number]
-                    if len(potd_row) > cfg.Config.config["potd_sheet_genre_col"]:
-                        genre = potd_row[cfg.Config.config["potd_sheet_genre_col"]]
+                    if len(potd_row) > cfg.config["potd_sheet_genre_col"]:
+                        genre = potd_row[cfg.config["potd_sheet_genre_col"]]
                     else:
                         genre = "(Unknown)"
-                    if len(potd_row) > cfg.Config.config["potd_sheet_difficulty_col"]:
-                        difficulty = potd_row[
-                            cfg.Config.config["potd_sheet_difficulty_col"]
-                        ]
+                    if len(potd_row) > cfg.config["potd_sheet_difficulty_col"]:
+                        difficulty = potd_row[cfg.config["potd_sheet_difficulty_col"]]
                     else:
                         difficulty = "(Unknown)"
 
@@ -677,13 +432,10 @@ class Marking(Cog):
                             [
                                 potd
                                 for potd in potd_rows
-                                if len(potd)
-                                > cfg.Config.config["potd_sheet_difficulty_col"]
-                                and len(potd)
-                                > cfg.Config.config["potd_sheet_genre_col"]
-                                and subj
-                                in potd[cfg.Config.config["potd_sheet_genre_col"]]
-                                and potd[cfg.Config.config["potd_sheet_difficulty_col"]]
+                                if len(potd) > cfg.config["potd_sheet_difficulty_col"]
+                                and len(potd) > cfg.config["potd_sheet_genre_col"]
+                                and subj in potd[cfg.config["potd_sheet_genre_col"]]
+                                and potd[cfg.config["potd_sheet_difficulty_col"]]
                                 == diff
                             ]
                         )
@@ -691,31 +443,33 @@ class Marking(Cog):
                             "**D"
                             + diff
                             + ":** "
-                            + f"{solved_ordered[subj][diff]} "
-                            + f"({len(solved_ordered[subj][diff])}/{total})"
+                            + f"{solved_ordered[subj][diff]} ({len(solved_ordered[subj][diff])}/{total})"
                             + "\n"
                         )
                     else:
                         output_string += f"**{diff}:** {solved_ordered[subj][diff]} \n"
                 if show_total:
-                    probs = [potd for x in solved_ordered[subj].values() for potd in x]
+                    probs = [potd for l in solved_ordered[subj].values() for potd in l]
                     total_subj = len(
                         [
                             potd
                             for potd in potd_rows
-                            if len(potd) > cfg.Config.config["potd_sheet_genre_col"]
-                            and subj in potd[cfg.Config.config["potd_sheet_genre_col"]]
+                            if len(potd) > cfg.config["potd_sheet_genre_col"]
+                            and potd[cfg.config["potd_sheet_genre_col"]] == subj
                         ]
                     )
                     output_string += f"(Total: {len(probs)}/{total_subj}) \n"
         else:
-            output_string = f"# __Your {adjective} POTD__ \n{potd_list}" + "\n"
-            if show_total is True:
+            if show_total:
+                output_string = f"__**Your {adjective} POTD**__ \n{potd_list}" + "\n"
+            else:
+                output_string = f"__**Your {adjective} POTD**__ \n{potd_list}" + "\n"
+            if show_total:
                 output_string += f"(Total: {len(potd_list)}/{len(potd_rows)})"
-
         await self.send_potd_solved(ctx, output_string)
 
-    # send message in batches of 1900+e characters because of 2k character limit
+    # send message in batches of 1900+e characters because of 2k character
+    # limit
     async def send_potd_solved(self, ctx, output_string):
         i = 0
         output_batch = ""

@@ -1,26 +1,14 @@
+import json
 import os
-import sqlite3
 from datetime import datetime, timezone
 
-import bidict
-from apiclient import discovery
+import asqlite
+from aiogoogle import Aiogoogle
+from aiogoogle.auth.creds import ServiceAccountCreds
 from discord.ext import commands
-from google.oauth2 import service_account
 from ruamel import yaml
 
 Cog = commands.Cog
-db = sqlite3.connect("data/modsdb.db")
-
-
-def is_staff(ctx):
-    return False if ctx.guild is None else ctx.author.id in Config.config["staff"]
-
-
-def is_mod_or_tech(ctx):
-    if ctx.guild is None or ctx.guild.id != Config.config["mods_guild"]:
-        return False
-    roles = list(map(lambda x: x.id, ctx.author.roles))
-    return Config.config["mod_role"] in roles or Config.config["tech_role"] in roles
 
 
 def timestamp(dt: datetime):
@@ -32,30 +20,20 @@ def timestamp(dt: datetime):
 class Config(Cog):
     config = None
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    secret_file = os.path.join(os.getcwd(), "config/credentials.json")
-
-    credentials = service_account.Credentials.from_service_account_file(
-        secret_file, scopes=scopes
-    )
-    service = discovery.build("sheets", "v4", credentials=credentials)
-
     def __init__(self, bot):
         with open("config/config.yml") as cfgfile:
             Config.config = yaml.safe_load(cfgfile)
         self.bot = bot
 
-        Config.config["pc_codes"] = bidict.bidict()
-        problem_curators = (
-            Config.service.spreadsheets()
-            .values()
-            .get(spreadsheetId=Config.config["potd_sheet"], range="Curators!A3:E")
-            .execute()
-            .get("values", [])
-        )
-        for pc in problem_curators:
-            Config.config["pc_codes"][int(pc[0])] = pc[2]
-        print(Config.config["pc_codes"])
+    async def cog_load(self):
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        secret_file = os.path.join(os.getcwd(), "config/credentials.json")
+        service_account_key = json.load(open(secret_file, "r"))
+        creds = ServiceAccountCreds(scopes=scopes, **service_account_key)
+        async with Aiogoogle(service_account_creds=creds) as aiogoogle:
+            Config.service = await aiogoogle.discover("sheets", "v4")
+            Config.aiogoogle = aiogoogle
+        Config.spreadsheet = Config.service.spreadsheets
 
     @commands.command(
         aliases=["cfl"],
@@ -70,3 +48,4 @@ class Config(Cog):
 
 async def setup(bot):
     await bot.add_cog(Config(bot))
+    Config.pool = await asqlite.create_pool(f'data/{Config.config["dbname"]}.db')
